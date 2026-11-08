@@ -258,6 +258,20 @@ pub fn windows(view: &Value) -> Vec<WindowSummary> {
         .collect()
 }
 
+/// A block's `owner` in a session view, or `None` when it has none.
+pub fn owner_of(view: &Value, block_id: &str) -> Option<String> {
+    let windows = view.get("windows").and_then(Value::as_array)?;
+    windows
+        .iter()
+        .filter_map(|window| window.get("layers").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|layer| layer.get("blocks").and_then(Value::as_array))
+        .flatten()
+        .find(|block| block.get("block_id").and_then(Value::as_str) == Some(block_id))
+        .and_then(|block| block.get("owner").and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
 pub fn has_block(view: &Value, block_id: &str) -> bool {
     let Some(windows) = view.get("windows").and_then(Value::as_array) else {
         return false;
@@ -395,6 +409,22 @@ mod tests {
                 }))
                 .collect::<Vec<_>>(),
         })
+    }
+
+    #[test]
+    fn reads_a_blocks_owner() {
+        let view = json!({
+            "windows": [{
+                "window_id": "window:1",
+                "layers": [{"blocks": [
+                    {"block_id": "block:1", "owner": "client:2"},
+                    {"block_id": "block:2"}
+                ]}]
+            }]
+        });
+        assert_eq!(owner_of(&view, "block:1").as_deref(), Some("client:2"));
+        assert_eq!(owner_of(&view, "block:2"), None);
+        assert_eq!(owner_of(&view, "block:3"), None);
     }
 
     #[test]

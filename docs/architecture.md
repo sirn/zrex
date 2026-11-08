@@ -46,6 +46,14 @@ Rather than entering the alternate screen or re-rendering cells through a second
 4. **Mode Cleanup on Detach (`Screen::leave`)**:
    When detaching or exiting, `Screen::leave` resets terminal modes that a remote program may have enabled while attached (synchronized output, Kitty keyboard stack, `modifyOtherKeys`, mouse tracking, focus reporting, bracketed paste, cursor keys, alternate screen `?1049l`, scroll region, cursor visibility, and SGR attributes) before disabling raw mode.
 
+## Host Theme Bridge
+
+Programs in a block ask the server, not the host terminal, for colors: the server answers `OSC 4`, `OSC 10`/`11`/`12`, DA1, and `CSI ? 996 n` from the block's own theme, and it answers the first three only once a theme exists. `zrex` keeps that theme equal to the host terminal's:
+
+1. **Attach probe (`Screen::probe_theme`)**: `theme_query` asks the host for its default foreground, background, and cursor colors and for all 256 palette entries, with DA1 as the completion sentinel.
+2. **Scheme reports (`WATCH_SCHEME`)**: `CSI ? 2031 h` makes the host report light and dark switches. A `CSI ? 997 ; n` report marks the theme dirty, and `Attached::refresh_theme` asks the host for its colors again and forwards the new theme to `com.superlogical.terminal.set_theme`; the server then tells programs that subscribed to scheme reports.
+3. **Ownership**: a block takes its size and colors from its owner, and the server gives it to the client that claimed it most recently. `zrex` claims with `session.own_block` (`mode: "take"`) when the user attaches or types in the block, and then applies its size and theme. It never claims in response to `block_owner_changed`, so two clients cannot trade a block forever; while another client owns it, `zrex` holds its size and theme for the next claim. A reconnect claims only when no other client owns the block. Every path that changes the size or the colors (attach, resize, scheme change, claim, ownership gained) publishes through one rule, which pushes only while this client holds the block.
+
 ## Protocol Details and Quirks
 
 ### Event Envelopes and Scope

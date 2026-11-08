@@ -22,6 +22,9 @@ const PROBE_TIME: Duration = Duration::from_secs(5);
 const RETRY_FIRST: Duration = Duration::from_millis(250);
 const RETRY_MAX: Duration = Duration::from_secs(5);
 const THEME_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
+/// DECSET 2031 asks the host terminal to report light and dark switches, which
+/// the block's theme follows while attached.
+const WATCH_SCHEME: &[u8] = b"\x1b[?2031h";
 
 const RESET_COLORS: &[u8] =
     b"\x1b]104\x1b\\\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\\x1b]104\x07\x1b]110\x07\x1b]111\x07\x1b]112\x07";
@@ -196,7 +199,7 @@ pub async fn attach(
                 }
             }
             Some(bytes) = input.recv() => {
-                match attached.burst(&bytes, &mut input, &mut ctrl) {
+                match attached.burst(&bytes, &mut input, &mut ctrl).await {
                     Ok(Flow::Detach) => {
                         detach(&mut ctrl, &attached).await;
                         guard.leave()?;
@@ -224,6 +227,22 @@ pub async fn attach(
                     Ok(Err(error)) => lost = Some(error),
                     Err(_) => lost = Some(anyhow!("the server stopped answering")),
                 }
+            }
+        }
+
+        if lost.is_none() && attached.theme_dirty {
+            match attached
+                .refresh_theme(guard.out(), &mut input, &mut ctrl)
+                .await
+            {
+                Ok(Flow::Continue) => {}
+                Ok(Flow::Detach) => {
+                    detach(&mut ctrl, &attached).await;
+                    guard.leave()?;
+                    println!("detached from {}", attached.session_id);
+                    return Ok(());
+                }
+                Err(error) => lost = Some(error),
             }
         }
 
@@ -293,6 +312,8 @@ struct Attached {
     out: Vec<u8>,
     input_buf: Vec<u8>,
     primed: bool,
+    theme_dirty: bool,
+    owns: bool,
 }
 
 impl Attached {
@@ -331,18 +352,17 @@ impl Attached {
                 (None, None) => anyhow!("the session's active window shows no block"),
             })?;
 
-        let take_rx = start_take(ctrl, session_id, &block_id)?;
-        let theme_rx = (!theme.is_empty())
-            .then(|| start_set_theme(ctrl, session_id, &block_id, &theme))
-            .transpose()?;
-        let resize_rx = start_resize(ctrl, session_id, &block_id, cols, rows)?;
+        finish_call(start_take(ctrl, session_id, &block_id)?).await?;
         let ticket_rx = start_ticket(ctrl, session_id, &block_id)?;
-
-        finish_call(take_rx).await?;
-        if let Some(rx) = theme_rx {
-            finish_call(rx).await?;
-        }
-        finish_call(resize_rx).await?;
+        publish(
+            ctrl,
+            session_id,
+            &block_id,
+            (cols, rows),
+            &theme,
+            Push::Both,
+        )
+        .await?;
         let ticket = parse_ticket(&finish_call(ticket_rx).await?)?;
         let data = Data::open(server, &ticket).await?;
         let filter = Filter::new(data.nonce);
@@ -359,6 +379,8 @@ impl Attached {
             out: Vec::new(),
             input_buf: Vec::new(),
             primed: false,
+            theme_dirty: false,
+            owns: true,
         };
         attached.focus(ctrl, "in")?;
         Ok(attached)
@@ -397,7 +419,47 @@ impl Attached {
         Ok(())
     }
 
-    fn burst(
+    /// Programs in the block ask the server for colors, so the theme zrex gave
+    /// the server has to keep up with the host or their answers go stale.
+    async fn refresh_theme(
+        &mut self,
+        out: &mut impl Write,
+        input: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+        ctrl: &mut Control,
+    ) -> Result<Flow> {
+        self.flush(out)?;
+        out.write_all(theme_query().as_bytes())?;
+        out.flush()?;
+        let deadline = Instant::now() + THEME_PROBE_TIMEOUT;
+        let mut replies = Vec::new();
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            let Ok(Some(bytes)) = tokio::time::timeout(remaining, input.recv()).await else {
+                break;
+            };
+            let (found, typed) = split_replies(&bytes);
+            replies.extend_from_slice(&found);
+            if !typed.is_empty() {
+                let flow = self.queue_input(&typed);
+                self.flush_input(ctrl)?;
+                if flow == Flow::Detach {
+                    return Ok(Flow::Detach);
+                }
+            }
+            if has_da1_reply(&replies) {
+                break;
+            }
+        }
+        self.theme_dirty = false;
+        let theme = parse_theme_reply(&replies);
+        if theme.is_empty() || theme == self.theme {
+            return Ok(Flow::Continue);
+        }
+        self.theme = theme;
+        self.sync(ctrl, Push::Theme).await?;
+        Ok(Flow::Continue)
+    }
+
+    async fn burst(
         &mut self,
         first: &[u8],
         input: &mut mpsc::UnboundedReceiver<Vec<u8>>,
@@ -413,7 +475,11 @@ impl Attached {
                 return Ok(Flow::Detach);
             }
         }
+        let typed = !self.input_buf.is_empty();
         self.flush_input(ctrl)?;
+        if typed && !self.owns {
+            self.claim(ctrl).await?;
+        }
         Ok(Flow::Continue)
     }
 
@@ -421,9 +487,12 @@ impl Attached {
         if is_detach(bytes) {
             return Flow::Detach;
         }
-        let filtered = strip_terminal_replies(bytes);
-        if !filtered.is_empty() {
-            self.input_buf.extend_from_slice(&filtered);
+        let (replies, typed) = split_replies(bytes);
+        if reports_scheme(&replies) {
+            self.theme_dirty = true;
+        }
+        if !typed.is_empty() {
+            self.input_buf.extend_from_slice(&typed);
         }
         Flow::Continue
     }
@@ -441,7 +510,31 @@ impl Attached {
             return Ok(());
         }
         self.size = (cols, rows);
-        resize(ctrl, &self.session_id, &self.block_id, cols, rows).await
+        self.sync(ctrl, Push::Size).await
+    }
+
+    async fn claim(&mut self, ctrl: &mut Control) -> Result<()> {
+        finish_call(start_take(ctrl, &self.session_id, &self.block_id)?).await?;
+        self.owns = true;
+        self.sync(ctrl, Push::Both).await
+    }
+
+    /// The block takes its size and colors from its owner, so this client
+    /// publishes its own only while it holds the block and keeps them for the
+    /// next claim.
+    async fn sync(&mut self, ctrl: &mut Control, push: Push) -> Result<()> {
+        if !self.owns {
+            return Ok(());
+        }
+        publish(
+            ctrl,
+            &self.session_id,
+            &self.block_id,
+            self.size,
+            &self.theme,
+            push,
+        )
+        .await
     }
 
     fn focus(&self, ctrl: &mut Control, action: &str) -> Result<()> {
@@ -481,8 +574,15 @@ impl Attached {
                     .get("owner")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if block == self.block_id && owner != self.client_id {
-                    take(ctrl, &self.session_id, &self.block_id).await?;
+                if block == self.block_id {
+                    // Claiming the block back here would make two clients trade
+                    // it forever, so a client that lost it waits for the user
+                    // to type.
+                    let owned = owner == self.client_id;
+                    if owned != self.owns {
+                        self.owns = owned;
+                        self.sync(ctrl, Push::Both).await?;
+                    }
                 }
             }
             "block_event" if block == self.block_id => {
@@ -555,14 +655,16 @@ impl Attached {
         if let Ok(size) = crossterm::terminal::size() {
             self.size = size;
         }
-        let (cols, rows) = self.size;
-        let take_rx = start_take(ctrl, &self.session_id, &self.block_id)?;
-        let theme_rx = (!self.theme.is_empty())
-            .then(|| start_set_theme(ctrl, &self.session_id, &self.block_id, &self.theme))
-            .transpose()?;
-        let resize_rx = start_resize(ctrl, &self.session_id, &self.block_id, cols, rows)?;
-
-        if let Err(error) = finish_call(take_rx).await {
+        // A dropped connection gives the block back to its owner, unless
+        // another client claimed it meanwhile. Claim it again only when
+        // nobody else holds it.
+        let owner = session::owner_of(view, &self.block_id);
+        if owner.is_some_and(|owner| owner != self.client_id) {
+            self.owns = false;
+            self.reconnect_data(ctrl).await?;
+            return Ok(None);
+        }
+        if let Err(error) = finish_call(start_take(ctrl, &self.session_id, &self.block_id)?).await {
             // A refusal while the block is still in the view is worth another
             // try. A missing block is not.
             if session::has_block(view, &self.block_id) {
@@ -570,10 +672,8 @@ impl Attached {
             }
             return Ok(Some(Ending::Block));
         }
-        if let Some(rx) = theme_rx {
-            finish_call(rx).await?;
-        }
-        finish_call(resize_rx).await?;
+        self.owns = true;
+        self.sync(ctrl, Push::Both).await?;
         self.reconnect_data(ctrl).await?;
         Ok(None)
     }
@@ -611,32 +711,51 @@ fn is_detach(bytes: &[u8]) -> bool {
     )
 }
 
+/// Asks the host terminal for its default colors and its whole 256-color
+/// palette. DA1 (`ESC [ c`) acts as a completion sentinel because terminals
+/// answer queries in order and always support DA1, even if they ignore OSC 4
+/// or OSC 10.
+fn theme_query() -> String {
+    let mut query = String::from("\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x07");
+    for index in 0..=255 {
+        query.push_str(&format!("\x1b]4;{index};?\x07"));
+    }
+    query.push_str("\x1b[c");
+    query
+}
+
 /// The Rex server's `libghostty-vt` answers terminal queries on the server
 /// side, so forwarding the local terminal's duplicate replies into
 /// `com.superlogical.terminal.write` would inject unconsumed escape sequences
-/// into the remote PTY.
-fn strip_terminal_replies(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
+/// into the remote PTY. The replies still carry the host's colors, which is why
+/// they are kept rather than dropped.
+fn split_replies(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut replies = Vec::new();
+    let mut typed = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == 0x1b && i + 1 < bytes.len() {
-            if bytes[i + 1] == b']'
-                && let Some(end) = osc_reply_end(&bytes[i..])
-            {
-                i += end;
-                continue;
-            }
-            if bytes[i + 1] == b'['
-                && let Some(end) = csi_reply_end(&bytes[i..])
-            {
+            let end = match bytes[i + 1] {
+                b']' => osc_reply_end(&bytes[i..]),
+                b'[' => csi_reply_end(&bytes[i..]),
+                _ => None,
+            };
+            if let Some(end) = end {
+                replies.extend_from_slice(&bytes[i..i + end]);
                 i += end;
                 continue;
             }
         }
-        out.push(bytes[i]);
+        typed.push(bytes[i]);
         i += 1;
     }
-    out
+    (replies, typed)
+}
+
+/// DECSET 2031's report: `ESC [ ? 997 ; Ps n`, where Ps is 1 for dark and 2
+/// for light.
+fn reports_scheme(replies: &[u8]) -> bool {
+    replies.windows(7).any(|window| window == b"\x1b[?997;")
 }
 
 fn osc_reply_end(slice: &[u8]) -> Option<usize> {
@@ -777,11 +896,6 @@ fn start_take(
     )
 }
 
-async fn take(ctrl: &mut Control, session_id: &str, block_id: &str) -> Result<()> {
-    finish_call(start_take(ctrl, session_id, block_id)?).await?;
-    Ok(())
-}
-
 fn start_set_theme(
     ctrl: &mut Control,
     session_id: &str,
@@ -815,14 +929,46 @@ fn start_resize(
     )
 }
 
-async fn resize(
+/// Which part of the block's state to publish. A client publishes what it
+/// changed while it holds the block, or both when it takes it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Push {
+    Size,
+    Theme,
+    Both,
+}
+
+impl Push {
+    fn size(self) -> bool {
+        matches!(self, Self::Size | Self::Both)
+    }
+
+    fn theme(self) -> bool {
+        matches!(self, Self::Theme | Self::Both)
+    }
+}
+
+async fn publish(
     ctrl: &mut Control,
     session_id: &str,
     block_id: &str,
-    cols: u16,
-    rows: u16,
+    size: (u16, u16),
+    theme: &Theme,
+    push: Push,
 ) -> Result<()> {
-    finish_call(start_resize(ctrl, session_id, block_id, cols, rows)?).await?;
+    let theme_rx = (push.theme() && !theme.is_empty())
+        .then(|| start_set_theme(ctrl, session_id, block_id, theme))
+        .transpose()?;
+    let size_rx = push
+        .size()
+        .then(|| start_resize(ctrl, session_id, block_id, size.0, size.1))
+        .transpose()?;
+    if let Some(rx) = theme_rx {
+        finish_call(rx).await?;
+    }
+    if let Some(rx) = size_rx {
+        finish_call(rx).await?;
+    }
     Ok(())
 }
 
@@ -1076,15 +1222,9 @@ impl Screen {
         })
     }
 
-    /// DA1 (`ESC [ c`) acts as a completion sentinel because terminals answer
-    /// queries in order and always support DA1, even if they ignore OSC 4/10.
     fn probe_theme(&mut self) -> Theme {
-        let mut query = String::from("\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x07");
-        for i in 0..16 {
-            query.push_str(&format!("\x1b]4;{i};?\x07"));
-        }
-        query.push_str("\x1b[c");
-        if self.stdout.write_all(query.as_bytes()).is_err() || self.stdout.flush().is_err() {
+        if self.stdout.write_all(theme_query().as_bytes()).is_err() || self.stdout.flush().is_err()
+        {
             return Theme::default();
         }
 
@@ -1116,6 +1256,10 @@ impl Screen {
                 break;
             }
         }
+        let _ = self
+            .stdout
+            .write_all(WATCH_SCHEME)
+            .and_then(|()| self.stdout.flush());
         parse_theme_reply(&buf)
     }
 
@@ -1173,8 +1317,9 @@ fn has_da1_reply(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attached, Ending, Flow, RETRY_FIRST, RETRY_MAX, Theme, backoff, closed_block,
-        has_da1_reply, is_detach, parse_theme_reply, strip_terminal_replies, take_utf8,
+        Attached, Ending, Flow, RETRY_FIRST, RETRY_MAX, Theme, backoff, closed_block, detach,
+        has_da1_reply, is_detach, parse_theme_reply, reports_scheme, split_replies, take_utf8,
+        theme_query,
     };
     use crate::rex::control::Control;
     use crate::rex::data::StreamClosed;
@@ -1231,7 +1376,7 @@ mod tests {
     }
 
     #[test]
-    fn strips_automatic_terminal_query_replies_from_stdin() {
+    fn separates_host_query_replies_from_typed_input() {
         let mixed = concat!(
             "abc",
             "\x1b]4;232;rgb:0808/0808/0808\x07",
@@ -1242,7 +1387,39 @@ mod tests {
             "def\x1b[A",
         )
         .as_bytes();
-        assert_eq!(strip_terminal_replies(mixed), b"abcdef\x1b[A");
+        let (replies, typed) = split_replies(mixed);
+        assert_eq!(typed, b"abcdef\x1b[A");
+        assert_eq!(
+            replies,
+            concat!(
+                "\x1b]4;232;rgb:0808/0808/0808\x07",
+                "\x1b]11;rgb:ffff/ffff/ffff\x1b\\",
+                "\x1b[?997;2n",
+                "\x1b[?62;22c",
+                "\x1b[>1;10;0c",
+            )
+            .as_bytes()
+        );
+    }
+
+    #[test]
+    fn spots_color_scheme_reports_from_the_host() {
+        let (replies, typed) = split_replies(b"\x1b[?997;2n");
+        assert!(reports_scheme(&replies));
+        assert!(typed.is_empty());
+
+        let (replies, _) = split_replies(b"\x1b]11;rgb:0000/0000/0000\x07");
+        assert!(!reports_scheme(&replies));
+    }
+
+    #[test]
+    fn asks_the_host_for_its_whole_palette_and_a_da1_sentinel() {
+        let query = theme_query();
+        assert!(query.starts_with("\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x07"));
+        assert!(query.contains("\x1b]4;0;?\x07"));
+        assert!(query.contains("\x1b]4;255;?\x07"));
+        assert!(!query.contains("\x1b]4;256;?\x07"));
+        assert!(query.ends_with("\x1b[c"));
     }
 
     #[test]
@@ -1350,13 +1527,15 @@ mod tests {
 
             let mut wrote = String::new();
             let mut saw_set_theme = false;
+            let mut theme_calls = 0;
+            let mut take_calls = 0;
             while let Some(Ok(Message::Text(text))) = ctrl_ws.next().await {
                 let req: Value = serde_json::from_str(&text).unwrap();
                 let id = req["id"].as_str().unwrap_or("");
                 let method = req["method"].as_str().unwrap();
                 if method == "com.superlogical.terminal.write" {
                     wrote.push_str(req["payload"]["args"]["data"].as_str().unwrap_or(""));
-                    break;
+                    continue;
                 }
                 if method == "block.event" {
                     continue;
@@ -1384,9 +1563,14 @@ mod tests {
                     "com.superlogical.terminal.set_theme" => {
                         assert_eq!(req["payload"]["args"]["scheme"], "light");
                         saw_set_theme = true;
+                        theme_calls += 1;
                         json!({})
                     }
-                    "session.own_block" | "com.superlogical.terminal.resize" => json!({}),
+                    "session.own_block" => {
+                        take_calls += 1;
+                        json!({})
+                    }
+                    "com.superlogical.terminal.resize" => json!({}),
                     "data.connect" => json!({
                         "ticket": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 16])
                     }),
@@ -1411,10 +1595,13 @@ mod tests {
                     ))
                     .await
                     .unwrap();
+                if method == "session.detach" {
+                    break;
+                }
             }
             assert!(saw_set_theme);
             let _data_ws = data_task.await.unwrap();
-            wrote
+            (wrote, theme_calls, take_calls)
         });
 
         let (mut ctrl, _events) = Control::connect(&format!("http://{addr}"), None)
@@ -1480,13 +1667,102 @@ mod tests {
         attached.flush(&mut clip_out).unwrap();
         assert_eq!(clip_out, b"\x1b]52;c;Y29waWVk\x07");
 
+        // The host reported a scheme change: zrex asks it for the colors again
+        // and hands the new theme to the block.
+        let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
+        host_tx
+            .send(
+                b"\x1b]10;rgb:1111/1111/1111\x07\x1b]11;rgb:eeee/eeee/eeee\x07\x1b[?62;22c"
+                    .to_vec(),
+            )
+            .unwrap();
+        let mut host_out = Vec::new();
+        let flow = attached
+            .refresh_theme(&mut host_out, &mut host_rx, &mut ctrl)
+            .await
+            .unwrap();
+        assert!(matches!(flow, Flow::Continue));
+        assert!(host_out.starts_with(b"\x1b]10;?\x07"));
+        assert_eq!(attached.theme.background.as_deref(), Some("#eeeeee"));
+        assert_eq!(attached.theme.scheme.as_deref(), Some("light"));
+
+        // Another client took the block. The block keeps that client's size
+        // and colors until this one is claimed back, so zrex claims nothing.
+        let owner = attached
+            .event(
+                "block_owner_changed",
+                &json!({
+                    "session_id": "session:1",
+                    "block_id": "block:1",
+                    "owner": "client:2"
+                }),
+                &mut ctrl,
+            )
+            .await
+            .unwrap();
+        assert!(owner.is_none());
+        assert!(!attached.owns);
+
+        // A scheme change while another client owns the block updates the
+        // colors zrex holds, but not the block's.
+        let (other_tx, mut other_rx) = tokio::sync::mpsc::unbounded_channel();
+        other_tx
+            .send(
+                b"\x1b]10;rgb:2222/2222/2222\x07\x1b]11;rgb:dddd/dddd/dddd\x07\x1b[?62;22c"
+                    .to_vec(),
+            )
+            .unwrap();
+        let mut other_out = Vec::new();
+        let flow = attached
+            .refresh_theme(&mut other_out, &mut other_rx, &mut ctrl)
+            .await
+            .unwrap();
+        assert!(matches!(flow, Flow::Continue));
+        assert_eq!(attached.theme.background.as_deref(), Some("#dddddd"));
+
+        // Typing in the terminal claims the block back, with this terminal's
+        // size and colors.
         let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel();
         in_tx.send(b" -l".to_vec()).unwrap();
         in_tx.send(b"a\n".to_vec()).unwrap();
-        let flow = attached.burst(b"ls", &mut in_rx, &mut ctrl).unwrap();
+        let flow = attached.burst(b"ls", &mut in_rx, &mut ctrl).await.unwrap();
         assert!(matches!(flow, Flow::Continue));
+        assert!(attached.owns);
 
-        let detach_flow = attached.burst(b"\x1c", &mut in_rx, &mut ctrl).unwrap();
+        // The other client gives the block up, so the server hands it to the
+        // client in line: this one. It takes this terminal's size and colors
+        // again without claiming anything.
+        attached
+            .event(
+                "block_owner_changed",
+                &json!({
+                    "session_id": "session:1",
+                    "block_id": "block:1",
+                    "owner": "client:2"
+                }),
+                &mut ctrl,
+            )
+            .await
+            .unwrap();
+        assert!(!attached.owns);
+        attached
+            .event(
+                "block_owner_changed",
+                &json!({
+                    "session_id": "session:1",
+                    "block_id": "block:1",
+                    "owner": "client:1"
+                }),
+                &mut ctrl,
+            )
+            .await
+            .unwrap();
+        assert!(attached.owns);
+
+        let detach_flow = attached
+            .burst(b"\x1c", &mut in_rx, &mut ctrl)
+            .await
+            .unwrap();
         assert!(matches!(detach_flow, Flow::Detach));
 
         let block_end = attached
@@ -1509,7 +1785,14 @@ mod tests {
             .unwrap();
         assert!(matches!(session_end, Some(Ending::Session)));
 
-        let wrote = server.await.unwrap();
+        detach(&mut ctrl, &attached).await;
+        let (wrote, theme_calls, take_calls) = server.await.unwrap();
         assert_eq!(wrote, "ls -la\n");
+        // Attach, a scheme change while owning, the claim on typing, and the
+        // block coming back from the other client.
+        assert_eq!(theme_calls, 4);
+        // Attach and the claim on typing; the other client's claim does not
+        // make zrex claim back.
+        assert_eq!(take_calls, 2);
     }
 }
