@@ -22,6 +22,14 @@ const PROBE_TIME: Duration = Duration::from_secs(5);
 const RETRY_FIRST: Duration = Duration::from_millis(250);
 const RETRY_MAX: Duration = Duration::from_secs(5);
 const THEME_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
+/// An unterminated local reply grows no larger than this before zrex stops
+/// holding it and forwards the bytes as input. The longest reply a terminal
+/// sends is a 256-color palette entry at 29 bytes.
+const MAX_HELD_REPLY: usize = 64;
+/// A terminal answers a query in one burst, so a fragment held this long was
+/// typing after all, and a reply this old is no longer a sign that more are
+/// coming.
+const REPLY_HOLD: Duration = Duration::from_millis(50);
 /// DECSET 2031 asks the host terminal to report light and dark switches, which
 /// the block's theme follows while attached.
 const WATCH_SCHEME: &[u8] = b"\x1b[?2031h";
@@ -123,7 +131,7 @@ pub async fn attach(
     };
     let size = crossterm::terminal::size()?;
     let mut guard = Screen::enter()?;
-    let theme = guard.probe_theme();
+    let (theme, probe_tail) = guard.probe_theme();
     let mut attached = Attached::start(
         &mut ctrl,
         &session_id,
@@ -134,6 +142,9 @@ pub async fn attach(
         theme,
     )
     .await?;
+    // Replies the probe deadline cut off arrive after it returns, so the reader
+    // that takes over stdin starts out holding the fragment it left.
+    attached.replies.hold(probe_tail);
 
     let mut input = spawn_input();
     let mut winch = signal(SignalKind::window_change())?;
@@ -208,6 +219,18 @@ pub async fn attach(
                     }
                     Ok(Flow::Continue) => {}
                     Err(error) => lost = Some(error),
+                }
+            }
+            // A fragment the host stopped sending was typing after all.
+            _ = stalled(attached.replies.due()) => {
+                // Another arm can hold the loop long enough for the host's
+                // continuation to queue up behind it, so take that first.
+                if input.is_empty() {
+                    if let Err(error) = attached.flush_held(&mut ctrl).await {
+                        lost = Some(error);
+                    }
+                } else {
+                    attached.replies.defer();
                 }
             }
             _ = winch.recv() => {
@@ -311,6 +334,7 @@ struct Attached {
     pending: Vec<u8>,
     out: Vec<u8>,
     input_buf: Vec<u8>,
+    replies: Replies,
     primed: bool,
     theme_dirty: bool,
     owns: bool,
@@ -378,6 +402,7 @@ impl Attached {
             pending: Vec::new(),
             out: Vec::new(),
             input_buf: Vec::new(),
+            replies: Replies::default(),
             primed: false,
             theme_dirty: false,
             owns: true,
@@ -436,15 +461,15 @@ impl Attached {
             let Ok(Some(bytes)) = tokio::time::timeout(remaining, input.recv()).await else {
                 break;
             };
-            let (found, typed) = split_replies(&bytes);
-            replies.extend_from_slice(&found);
-            if !typed.is_empty() {
-                let flow = self.queue_input(&typed);
-                self.flush_input(ctrl)?;
-                if flow == Flow::Detach {
-                    return Ok(Flow::Detach);
-                }
+            if is_detach(&bytes) {
+                return Ok(Flow::Detach);
             }
+            let (found, typed) = self.replies.push(&bytes);
+            replies.extend_from_slice(&found);
+            if self.accept(&found, &typed) == Flow::Detach {
+                return Ok(Flow::Detach);
+            }
+            self.flush_input(ctrl)?;
             if has_da1_reply(&replies) {
                 break;
             }
@@ -487,14 +512,38 @@ impl Attached {
         if is_detach(bytes) {
             return Flow::Detach;
         }
-        let (replies, typed) = split_replies(bytes);
-        if reports_scheme(&replies) {
+        let (replies, typed) = self.replies.push(bytes);
+        self.accept(&replies, &typed)
+    }
+
+    /// Keeps what `Replies::push` classified without parsing the bytes twice.
+    fn accept(&mut self, replies: &[u8], typed: &[u8]) -> Flow {
+        if reports_scheme(replies) {
             self.theme_dirty = true;
         }
+        // The detach key can share a read with the reply the host just sent.
+        if is_detach(typed) {
+            return Flow::Detach;
+        }
         if !typed.is_empty() {
-            self.input_buf.extend_from_slice(&typed);
+            self.input_buf.extend_from_slice(typed);
         }
         Flow::Continue
+    }
+
+    /// Forwards a fragment the host stopped sending partway through.
+    async fn flush_held(&mut self, ctrl: &mut Control) -> Result<()> {
+        let held = self.replies.give_up();
+        if held.is_empty() {
+            return Ok(());
+        }
+        self.input_buf.extend_from_slice(&held);
+        self.flush_input(ctrl)?;
+        // Typing this late still makes this client the block's owner.
+        if !self.owns {
+            self.claim(ctrl).await?;
+        }
+        Ok(())
     }
 
     fn flush_input(&mut self, ctrl: &mut Control) -> Result<()> {
@@ -750,6 +799,146 @@ fn split_replies(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
         i += 1;
     }
     (replies, typed)
+}
+
+/// Holds a reply that arrived only partly: one `theme_query` answer is larger
+/// than the 4096-byte reads the input thread hands out, so replies regularly
+/// straddle two of them. Half a reply looks like typed input on its own and
+/// would be forwarded into the block's PTY, whose program echoes the bytes.
+#[derive(Default)]
+struct Replies {
+    held: Vec<u8>,
+    /// When the host has been silent long enough for `held` to be typing.
+    until: Option<Instant>,
+    /// When the last read carried a reply, so the host may still be sending one.
+    answered: Option<Instant>,
+}
+
+impl Replies {
+    fn push(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let now = Instant::now();
+        let resumed = !self.held.is_empty();
+        let answering = self.answered.is_some_and(|at| now < at + REPLY_HOLD);
+        let mut pending = std::mem::take(&mut self.held);
+        pending.extend_from_slice(bytes);
+        let cut = reply_tail(&pending).unwrap_or(pending.len());
+        let (replies, mut typed) = split_replies(&pending[..cut]);
+        let mut fragment = pending.split_off(cut);
+        // Nothing here answered a query, so an opener at the end is a keypress:
+        // holding it would merge it with the next key into an Alt combination.
+        // A reply burst never arrives as one or two bytes.
+        if !resumed && !answering && replies.is_empty() && bare_opener(&fragment) {
+            typed.extend_from_slice(&fragment);
+            fragment.clear();
+        }
+        self.hold_at(fragment, now);
+        self.answered = (!replies.is_empty()).then_some(now);
+        (replies, typed)
+    }
+
+    /// Keeps a fragment back for the read that finishes it, and starts the clock
+    /// that gives up on it.
+    fn hold(&mut self, fragment: Vec<u8>) {
+        self.hold_at(fragment, Instant::now());
+    }
+
+    fn hold_at(&mut self, fragment: Vec<u8>, now: Instant) {
+        self.until = (!fragment.is_empty()).then(|| now + REPLY_HOLD);
+        self.held = fragment;
+    }
+
+    /// When the host has been silent long enough for `held` to be typing.
+    fn due(&self) -> Option<Instant> {
+        self.until
+    }
+
+    /// Postpones the clock while queued input can still finish the fragment.
+    fn defer(&mut self) {
+        if !self.held.is_empty() {
+            self.until = Some(Instant::now() + REPLY_HOLD);
+        }
+    }
+
+    /// Hands back a fragment the host stopped sending, which was typing.
+    fn give_up(&mut self) -> Vec<u8> {
+        self.until = None;
+        self.answered = None;
+        std::mem::take(&mut self.held)
+    }
+}
+
+/// True for the fragments that are ambiguous on their own: the Escape key, Alt+[
+/// and Alt+].
+fn bare_opener(fragment: &[u8]) -> bool {
+    matches!(fragment, [0x1b] | [0x1b, b'['] | [0x1b, b']'])
+}
+
+const REPLY_CODES: [&[u8]; 4] = [b"4", b"10", b"11", b"12"];
+
+/// Where a reply that is still arriving starts, if the buffer ends inside one.
+/// An unfinished reply runs to the end of the buffer, so its start is the first
+/// ESC that opens a sequence which never closes: the terminator a reply waits
+/// for can itself arrive split, as ESC then backslash.
+fn reply_tail(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .iter()
+        .enumerate()
+        .filter(|&(_, &b)| b == 0x1b)
+        .map(|(start, _)| start)
+        .find(|&start| tail_unfinished(&bytes[start..]))
+}
+
+/// True while the reply starting at tail has not finished arriving. Whether a
+/// lone ESC or a bare opener really is one is up to `Replies`, which knows what
+/// the rest of the read held.
+fn tail_unfinished(tail: &[u8]) -> bool {
+    if tail.len() > MAX_HELD_REPLY {
+        return false;
+    }
+    match tail {
+        [0x1b] => true,
+        [0x1b, b']', rest @ ..] => osc_open(rest),
+        [0x1b, b'[', rest @ ..] => csi_open(rest),
+        _ => false,
+    }
+}
+
+/// True while `rest` is the unfinished body of an `OSC 4` or `OSC 10`/`11`/`12`
+/// reply.
+fn osc_open(rest: &[u8]) -> bool {
+    if rest.contains(&0x07) || rest.windows(2).any(|pair| pair == b"\x1b\\") {
+        return false;
+    }
+    let end = rest
+        .iter()
+        .position(|&b| !b.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let code = &rest[..end];
+    if end < rest.len() {
+        // The code is complete, so both `;` and a reply code are required.
+        return rest[end] == b';' && REPLY_CODES.contains(&code);
+    }
+    if code.is_empty() {
+        // `ESC ]` alone is either Alt+] or an OSC reply starting up.
+        return true;
+    }
+    REPLY_CODES.iter().any(|want| want.starts_with(code))
+}
+
+/// True while `rest` is the unfinished parameter bytes of a CSI reply. A
+/// complete control sequence, and anything without the `?`/`>` that only
+/// replies carry, is typing that has to reach the block untouched.
+fn csi_open(rest: &[u8]) -> bool {
+    if rest.iter().any(|&b| (0x40..=0x7e).contains(&b)) {
+        return false;
+    }
+    match rest {
+        [] => true,
+        [b'?' | b'>', params @ ..] => params
+            .iter()
+            .all(|&b| b.is_ascii_digit() || b == b';' || b == b':'),
+        _ => false,
+    }
 }
 
 /// DECSET 2031's report: `ESC [ ? 997 ; Ps n`, where Ps is 1 for dark and 2
@@ -1064,6 +1253,15 @@ async fn read_chunks(
     Ok(out)
 }
 
+/// Resolves when a held fragment has waited long enough to count as typing, and
+/// never while nothing is held.
+async fn stalled(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at.into()).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 fn spawn_input() -> mpsc::UnboundedReceiver<Vec<u8>> {
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
@@ -1096,8 +1294,10 @@ async fn recover(
     loop {
         match attempt(server, token, ctrl, events, attached).await {
             Ok(None) => {
-                // Keys pressed while the link was down have nowhere to go.
+                // Keys pressed while the link was down have nowhere to go,
+                // and the reply a held fragment belonged to is gone with them.
                 while input.try_recv().is_ok() {}
+                attached.replies = Replies::default();
                 return Ok(Recovered::Live);
             }
             Ok(Some(ending)) => return Ok(Recovered::Ended(ending)),
@@ -1222,10 +1422,11 @@ impl Screen {
         })
     }
 
-    fn probe_theme(&mut self) -> Theme {
+    /// Returns the theme and the tail of a reply the deadline cut off.
+    fn probe_theme(&mut self) -> (Theme, Vec<u8>) {
         if self.stdout.write_all(theme_query().as_bytes()).is_err() || self.stdout.flush().is_err()
         {
-            return Theme::default();
+            return (Theme::default(), Vec::new());
         }
 
         let stdin = std::io::stdin();
@@ -1260,7 +1461,8 @@ impl Screen {
             .stdout
             .write_all(WATCH_SCHEME)
             .and_then(|()| self.stdout.flush());
-        parse_theme_reply(&buf)
+        let tail = reply_tail(&buf).map_or_else(Vec::new, |start| buf[start..].to_vec());
+        (parse_theme_reply(&buf), tail)
     }
 
     fn out(&mut self) -> &mut std::io::Stdout {
@@ -1317,9 +1519,9 @@ fn has_da1_reply(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attached, Ending, Flow, RETRY_FIRST, RETRY_MAX, Theme, backoff, closed_block, detach,
-        has_da1_reply, is_detach, parse_theme_reply, reports_scheme, split_replies, take_utf8,
-        theme_query,
+        Attached, Ending, Flow, RETRY_FIRST, RETRY_MAX, Replies, Theme, backoff, closed_block,
+        detach, has_da1_reply, is_detach, parse_theme_reply, reports_scheme, split_replies,
+        take_utf8, theme_query,
     };
     use crate::rex::control::Control;
     use crate::rex::data::StreamClosed;
@@ -1400,6 +1602,126 @@ mod tests {
             )
             .as_bytes()
         );
+    }
+
+    fn palette_reply(terminator: &[u8], entries: usize) -> Vec<u8> {
+        let mut stream = Vec::new();
+        for code in ["10", "11", "12"] {
+            stream.extend_from_slice(format!("\x1b]{code};rgb:cdcd/d6d6/f4f4").as_bytes());
+            stream.extend_from_slice(terminator);
+        }
+        for index in 0..entries {
+            stream.extend_from_slice(format!("\x1b]4;{index};rgb:0000/0000/0000").as_bytes());
+            stream.extend_from_slice(terminator);
+        }
+        stream.extend_from_slice(b"\x1b[?62;22c");
+        stream
+    }
+
+    #[test]
+    fn holds_replies_split_across_reads_until_the_rest_arrives() {
+        let mut replies = Replies::default();
+        let (found, typed) = replies.push(b"ab\x1b]4;147;rgb:000");
+        assert!(found.is_empty());
+        assert_eq!(typed, b"ab");
+
+        let (found, typed) = replies.push(b"0/0000/0000\x1b\\\x1b");
+        assert!(typed.is_empty());
+        assert_eq!(found, b"\x1b]4;147;rgb:0000/0000/0000\x1b\\");
+
+        let (found, typed) = replies.push(b"[");
+        assert!(found.is_empty());
+        assert!(typed.is_empty());
+
+        let (found, typed) = replies.push(b"?62;22c");
+        assert!(typed.is_empty());
+        assert_eq!(found, b"\x1b[?62;22c");
+        assert!(replies.due().is_none());
+    }
+
+    #[test]
+    fn forwards_nothing_when_a_read_splits_a_palette_reply() {
+        for terminator in [b"\x07".as_slice(), b"\x1b\\".as_slice()] {
+            let stream = palette_reply(terminator, 256);
+            // A cut of one or two bytes is the Escape key or Alt+[ rather than
+            // the start of a reply, so the burst starts at three.
+            for cut in 3..stream.len() {
+                let mut replies = Replies::default();
+                let (mut found, typed) = replies.push(&stream[..cut]);
+                assert_eq!(typed, b"", "typed before the split at {cut}");
+                let (kept, typed) = replies.push(&stream[cut..]);
+                assert_eq!(typed, b"", "typed after the split at {cut}");
+                found.extend_from_slice(&kept);
+                assert_eq!(found, stream, "replies around the split at {cut}");
+                assert!(replies.due().is_none(), "held after the split at {cut}");
+            }
+        }
+    }
+
+    #[test]
+    fn holds_a_lone_escape_that_arrives_right_after_a_reply() {
+        let mut replies = Replies::default();
+        let (found, typed) = replies.push(b"\x1b]11;rgb:ffff/ffff/ffff\x07\x1b");
+        assert_eq!(found, b"\x1b]11;rgb:ffff/ffff/ffff\x07");
+        assert!(typed.is_empty());
+        assert!(replies.due().is_some());
+
+        let (found, typed) = replies.push(b"]4;147;rgb:0000/0000/0000\x07");
+        assert!(typed.is_empty());
+        assert_eq!(found, b"\x1b]4;147;rgb:0000/0000/0000\x07");
+        assert!(replies.due().is_none());
+    }
+
+    #[test]
+    fn hands_a_lone_escape_back_when_the_host_stays_silent() {
+        let mut replies = Replies::default();
+        assert!(replies.push(b"\x1b]11;rgb:ffff/ffff/ffff\x07").1.is_empty());
+        assert!(replies.push(b"\x1b").1.is_empty());
+        assert!(replies.due().is_some());
+        assert_eq!(replies.give_up(), b"\x1b");
+        assert!(replies.due().is_none());
+    }
+
+    #[test]
+    fn hands_a_half_reply_back_only_after_the_host_stops_sending() {
+        let mut replies = Replies::default();
+        let (found, typed) = replies.push(b"\x1b]4;147;rgb:000");
+        assert!(found.is_empty());
+        assert!(typed.is_empty());
+
+        let (found, typed) = replies.push(b"0/0000/0000\x07");
+        assert!(typed.is_empty());
+        assert_eq!(found, b"\x1b]4;147;rgb:0000/0000/0000\x07");
+
+        let (found, typed) = replies.push(b"\x1b]4;147;rgb:000");
+        assert!(found.is_empty() && typed.is_empty());
+        assert_eq!(replies.give_up(), b"\x1b]4;147;rgb:000");
+    }
+
+    #[test]
+    fn finishes_a_reply_the_startup_probe_read_only_the_start_of() {
+        let mut replies = Replies::default();
+        replies.hold(b"\x1b]11;rgb:ffff".to_vec());
+        let (found, typed) = replies.push(b"/ffff/ffff\x07");
+        assert!(typed.is_empty());
+        assert_eq!(found, b"\x1b]11;rgb:ffff/ffff/ffff\x07");
+    }
+
+    #[test]
+    fn forwards_input_that_only_looks_like_the_start_of_a_reply() {
+        let mut replies = Replies::default();
+        // The Escape key, Alt+[ and Alt+] on their own are keypresses, not the
+        // start of a reply.
+        assert_eq!(replies.push(b"\x1b").1, b"\x1b");
+        assert_eq!(replies.push(b"\x1b[").1, b"\x1b[");
+        assert_eq!(replies.push(b"\x1b]").1, b"\x1b]");
+        assert_eq!(replies.push(b"\x1b[A").1, b"\x1b[A");
+        assert_eq!(replies.push(b"\x1b[<0;3;4M").1, b"\x1b[<0;3;4M");
+        assert_eq!(replies.push(b"\x1b]0;title\x07").1, b"\x1b]0;title\x07");
+        assert_eq!(replies.push(b"\x1b]abc\r").1, b"\x1b]abc\r");
+        assert_eq!(replies.push(b"\x1b[?x").1, b"\x1b[?x");
+        // OSC 1 is a title query, not a palette reply.
+        assert_eq!(replies.push(b"\x1b]1;title\x07").1, b"\x1b]1;title\x07");
     }
 
     #[test]
