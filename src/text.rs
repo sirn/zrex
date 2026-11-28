@@ -1,3 +1,5 @@
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 /// Server- and program-provided text must not send terminal escapes or span
 /// multiple lines.
 pub fn clean_one_line(text: &str) -> String {
@@ -26,6 +28,42 @@ pub fn clean_truncated(text: &str, max_chars: usize) -> String {
         short.push('…');
     }
     short
+}
+
+pub fn prefix_to_columns(text: &str, max_columns: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if used + ch_width > max_columns {
+            break;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
+    out
+}
+
+/// Truncates `text` to fit within `max_columns` display columns, reserving room
+/// for a trailing `…` when truncated. Returns `(visible_prefix, was_truncated)`.
+pub fn truncate_to_columns(text: &str, max_columns: usize) -> (String, bool) {
+    if max_columns == 0 || text.is_empty() {
+        return (String::new(), false);
+    }
+    if text.width() <= max_columns {
+        return (text.to_owned(), false);
+    }
+    let ellipsis_width = '…'.width().unwrap_or(1);
+    let visible = prefix_to_columns(text, max_columns.saturating_sub(ellipsis_width));
+    (visible, max_columns >= ellipsis_width)
+}
+
+pub fn truncate_with_ellipsis(text: &str, max_columns: usize) -> String {
+    let (mut visible, truncated) = truncate_to_columns(text, max_columns);
+    if truncated {
+        visible.push('…');
+    }
+    visible
 }
 
 pub fn percent_decode(input: &str) -> String {
@@ -88,6 +126,16 @@ mod tests {
         assert_eq!(clean_truncated("", 0), "");
         assert_eq!(clean_truncated("abc", 1), "…");
         assert_eq!(clean_truncated(&"x".repeat(100), 80).chars().count(), 80);
+    }
+
+    #[test]
+    fn truncate_to_columns_respects_display_width() {
+        assert_eq!(truncate_to_columns("πππ", 5), ("πππ".to_owned(), false));
+        assert_eq!(truncate_to_columns("πππ", 2), ("π".to_owned(), true));
+        assert_eq!(truncate_to_columns("πππ", 1), (String::new(), true));
+        assert_eq!(truncate_to_columns("πππ", 0), (String::new(), false));
+        assert_eq!(truncate_with_ellipsis("你好世界", 4), "你…");
+        assert_eq!(truncate_with_ellipsis("你好世界", 0), "");
     }
 
     #[test]

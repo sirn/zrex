@@ -165,6 +165,90 @@ fn basename(value: &str) -> &str {
     trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed)
 }
 
+pub fn is_known_agent_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let stem = lower
+        .strip_suffix(".js")
+        .or_else(|| lower.strip_suffix(".mjs"))
+        .or_else(|| lower.strip_suffix(".cjs"))
+        .or_else(|| lower.strip_suffix(".py"))
+        .or_else(|| lower.strip_suffix(".sh"))
+        .unwrap_or(&lower);
+    matches!(
+        stem,
+        "agy"
+            | "antigravity"
+            | "claude"
+            | "claude-code"
+            | "codex"
+            | "gemini"
+            | "opencode"
+            | "aider"
+            | "amp"
+            | "goose"
+            | "copilot"
+            | "pi"
+            | "cursor-agent"
+            | "kiro"
+            | "kiro-cli"
+            | "droid"
+            | "crush"
+            | "cline"
+            | "qwen"
+    )
+}
+
+/// Returns true when the terminal's live process tree includes a known coding
+/// agent (checking `foreground`, `child`, and `ancestors`).
+pub fn has_agent_process(reply: &Value) -> bool {
+    if reply.get("last_exit").is_some_and(|value| !value.is_null()) {
+        return false;
+    }
+    [reply.get("foreground"), reply.get("child")]
+        .into_iter()
+        .flatten()
+        .chain(
+            reply
+                .get("ancestors")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten(),
+        )
+        .any(process_entry_is_agent)
+}
+
+fn process_entry_is_agent(process: &Value) -> bool {
+    if process.is_null() {
+        return false;
+    }
+    for (key, strip_login_dash) in [
+        ("script", false),
+        ("argv0", true),
+        ("invoked_path", false),
+        ("name", false),
+    ] {
+        let Some(raw) = process.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        let cleaned = clean_one_line(raw);
+        let candidate = if strip_login_dash {
+            cleaned.strip_prefix('-').unwrap_or(&cleaned)
+        } else {
+            &cleaned
+        };
+        let base = basename(candidate);
+        let base = if strip_login_dash {
+            base.strip_prefix('-').unwrap_or(base)
+        } else {
+            base
+        };
+        if !base.is_empty() && is_known_agent_name(base) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Derives a pane's display title from its live terminal title, falling back
 /// to the foreground process name (and OSC 7 working directory when a VT
 /// snapshot is available).
@@ -246,6 +330,60 @@ pub async fn destroy(ctrl: &mut Control, session_id: &str) -> Result<()> {
 }
 
 /// Renames a session. Requires prior `session::attach` (or `session.bootstrap`).
+pub async fn set_label(ctrl: &mut Control, session_id: &str, label: &str) -> Result<()> {
+    ctrl.call(
+        "session.set_label",
+        json!({"session_id": session_id, "label": label}),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Renames a window. Requires prior `session::attach` (or `session.bootstrap`).
+pub async fn set_window_label(
+    ctrl: &mut Control,
+    session_id: &str,
+    window_id: &str,
+    label: &str,
+) -> Result<()> {
+    ctrl.call(
+        "session.set_window_label",
+        json!({"session_id": session_id, "window_id": window_id, "label": label}),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Renames a block. Requires prior `session::attach` (or `session.bootstrap`).
+pub async fn set_block_label(ctrl: &mut Control, block: BlockRef<'_>, label: &str) -> Result<()> {
+    ctrl.call(
+        "session.set_block_label",
+        json!({"session_id": block.session_id, "block_id": block.block_id, "label": label}),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Closes a window. Requires prior `session::attach` (or `session.bootstrap`).
+pub async fn close_window(ctrl: &mut Control, session_id: &str, window_id: &str) -> Result<()> {
+    ctrl.call(
+        "session.close_window",
+        json!({"session_id": session_id, "window_id": window_id}),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Closes a block. Requires prior `session::attach` (or `session.bootstrap`).
+pub async fn close_block(ctrl: &mut Control, block: BlockRef<'_>) -> Result<()> {
+    ctrl.call(
+        "block.close",
+        json!({"session_id": block.session_id, "block_id": block.block_id}),
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn ensure_window(
     ctrl: &mut Control,
     session_id: &str,
@@ -829,6 +967,33 @@ mod tests {
                             json!({"window_id": "window:default"})
                         }
                     }
+                    "session.set_label" => {
+                        assert_eq!(req["payload"]["session_id"], "session:1111-aaaa");
+                        assert_eq!(req["payload"]["label"], "renamed-session");
+                        json!({"revision": 2})
+                    }
+                    "session.set_window_label" => {
+                        assert_eq!(req["payload"]["session_id"], "session:1111-aaaa");
+                        assert_eq!(req["payload"]["window_id"], "window:1");
+                        assert_eq!(req["payload"]["label"], "renamed-window");
+                        json!({"revision": 3})
+                    }
+                    "session.set_block_label" => {
+                        assert_eq!(req["payload"]["session_id"], "session:1111-aaaa");
+                        assert_eq!(req["payload"]["block_id"], "block:1");
+                        assert_eq!(req["payload"]["label"], "");
+                        json!({"revision": 4})
+                    }
+                    "session.close_window" => {
+                        assert_eq!(req["payload"]["session_id"], "session:1111-aaaa");
+                        assert_eq!(req["payload"]["window_id"], "window:1");
+                        json!({"revision": 5})
+                    }
+                    "block.close" => {
+                        assert_eq!(req["payload"]["session_id"], "session:1111-aaaa");
+                        assert_eq!(req["payload"]["block_id"], "block:1");
+                        json!({"block_id": "block:1", "revision": 6})
+                    }
                     other => panic!("unexpected method {other}"),
                 };
                 ws.send(Message::text(
@@ -906,6 +1071,22 @@ mod tests {
                 .unwrap(),
             ("window:default".to_owned(), None)
         );
+
+        set_label(&mut ctrl, "session:1111-aaaa", "renamed-session")
+            .await
+            .unwrap();
+        set_window_label(&mut ctrl, "session:1111-aaaa", "window:1", "renamed-window")
+            .await
+            .unwrap();
+        set_block_label(&mut ctrl, BlockRef::new("session:1111-aaaa", "block:1"), "")
+            .await
+            .unwrap();
+        close_window(&mut ctrl, "session:1111-aaaa", "window:1")
+            .await
+            .unwrap();
+        close_block(&mut ctrl, BlockRef::new("session:1111-aaaa", "block:1"))
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -1076,5 +1257,56 @@ mod tests {
             process_pwd_title(Some(&process), Some(b"no osc7")).as_deref(),
             Some("zsh")
         );
+    }
+
+    #[test]
+    fn detects_known_agent_processes_across_fields_and_ancestors() {
+        assert!(has_agent_process(&json!({
+            "last_exit": null,
+            "foreground": {"pid": 200, "name": "agy"}
+        })));
+        assert!(has_agent_process(&json!({
+            "last_exit": null,
+            "foreground": {
+                "pid": 201,
+                "name": "node",
+                "script": "/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js"
+            }
+        })));
+        assert!(has_agent_process(&json!({
+            "last_exit": null,
+            "foreground": {
+                "pid": 202,
+                "name": "2.1.76",
+                "argv0": "claude",
+                "script": "/opt/claude/cli.js"
+            }
+        })));
+        assert!(has_agent_process(&json!({
+            "last_exit": null,
+            "foreground": {
+                "pid": 203,
+                "name": "node",
+                "invoked_path": "/opt/homebrew/bin/gemini"
+            }
+        })));
+        assert!(has_agent_process(&json!({
+            "last_exit": null,
+            "foreground": {"pid": 300, "name": "cargo"},
+            "ancestors": [
+                {"pid": 250, "name": "zsh"},
+                {"pid": 200, "name": "claude"}
+            ],
+            "child": {"pid": 100, "name": "login"}
+        })));
+        assert!(!has_agent_process(&json!({
+            "last_exit": {"exit_code": 0},
+            "foreground": {"pid": 200, "name": "claude"}
+        })));
+        assert!(!has_agent_process(&json!({
+            "last_exit": null,
+            "foreground": {"pid": 200, "argv0": "-zsh", "name": "zsh"},
+            "child": {"pid": 100, "name": "login"}
+        })));
     }
 }

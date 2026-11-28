@@ -156,17 +156,34 @@ impl Control {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
 
+        let writer_pending = Arc::clone(&pending);
+        let writer_alive = Arc::clone(&alive);
         tokio::spawn(async move {
             while let Some(first) = out_rx.recv().await {
                 if sink.feed(first).await.is_err() {
+                    mark_dead_and_fail(
+                        &writer_alive,
+                        &writer_pending,
+                        "the control connection closed",
+                    );
                     break;
                 }
                 while let Ok(next) = out_rx.try_recv() {
                     if sink.feed(next).await.is_err() {
+                        mark_dead_and_fail(
+                            &writer_alive,
+                            &writer_pending,
+                            "the control connection closed",
+                        );
                         return;
                     }
                 }
                 if sink.flush().await.is_err() {
+                    mark_dead_and_fail(
+                        &writer_alive,
+                        &writer_pending,
+                        "the control connection closed",
+                    );
                     break;
                 }
             }
@@ -176,12 +193,12 @@ impl Control {
         let reader_alive = Arc::clone(&alive);
         let pong_tx = out_tx.clone();
         let reader = tokio::spawn(async move {
-            let _mark = MarkDead(reader_alive);
+            let _mark = MarkDead(Arc::clone(&reader_alive));
             while let Some(message) = stream.next().await {
                 let message = match message {
                     Ok(message) => message,
                     Err(error) => {
-                        fail_all(&reader_pending, &error.to_string());
+                        mark_dead_and_fail(&reader_alive, &reader_pending, &error.to_string());
                         break;
                     }
                 };
@@ -193,7 +210,11 @@ impl Control {
                         None
                     }
                     Message::Close(_) => {
-                        fail_all(&reader_pending, "the server closed the connection");
+                        mark_dead_and_fail(
+                            &reader_alive,
+                            &reader_pending,
+                            "the server closed the connection",
+                        );
                         break;
                     }
                     _ => None,
@@ -219,7 +240,11 @@ impl Control {
                     Some(Incoming::Welcome(_)) | Some(Incoming::Unknown) | None => {}
                 }
             }
-            fail_all(&reader_pending, "the control connection ended");
+            mark_dead_and_fail(
+                &reader_alive,
+                &reader_pending,
+                "the control connection ended",
+            );
         });
 
         Ok((
@@ -302,9 +327,10 @@ impl Control {
 
     fn send_request(&self, id: &str, method: &str, payload: Value) -> Result<()> {
         let message = serde_json::to_string(&proto::request(id, method, payload))?;
-        self.out
-            .send(Message::text(message))
-            .map_err(|_| anyhow!("the control connection is closed"))
+        self.out.send(Message::text(message)).map_err(|_| {
+            self.alive.store(false, Ordering::SeqCst);
+            anyhow!("the control connection is closed")
+        })
     }
 
     /// Starts a `com.superlogical.terminal.write` call and returns its reply
@@ -351,7 +377,8 @@ impl Drop for MarkDead {
     }
 }
 
-fn fail_all(pending: &Pending, reason: &str) {
+fn mark_dead_and_fail(alive: &AtomicBool, pending: &Pending, reason: &str) {
+    alive.store(false, Ordering::SeqCst);
     for (_, waiter) in pending.lock().unwrap().drain() {
         let _ = waiter.send(Err(anyhow!("{reason}")));
     }
@@ -555,5 +582,46 @@ mod tests {
             .unwrap_err();
         assert!(err.downcast_ref::<CallTimeout>().is_some());
         assert!(ctrl.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn marks_control_lost_before_failing_pending_calls_on_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            #[allow(
+                clippy::result_large_err,
+                reason = "tungstenite fixes the callback error type"
+            )]
+            let mut ws = accept_hdr_async(stream, |req: &Request, mut res: Response| {
+                if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                    res.headers_mut()
+                        .insert("Sec-WebSocket-Protocol", proto.clone());
+                }
+                Ok(res)
+            })
+            .await
+            .unwrap();
+
+            let _ = ws.next().await;
+            ws.send(Message::text(
+                json!({"type": "welcome", "api_revision": proto::API_REVISION}).to_string(),
+            ))
+            .await
+            .unwrap();
+            // Read request and immediately drop the connection without replying.
+            let _ = ws.next().await;
+            let _ = ws.close(None).await;
+        });
+
+        let server: ServerAddress = format!("http://{addr}").parse().unwrap();
+        let (mut ctrl, _events) = Control::connect(&server, None).await.unwrap();
+        let err = ctrl.call("server.version", Value::Null).await.unwrap_err();
+        assert!(
+            ctrl.is_lost(),
+            "expected is_lost() to be true on error: {err:#}"
+        );
     }
 }

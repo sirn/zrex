@@ -9,4 +9,8 @@ _zrex() {
   compadd -M 'm:{a-zA-Z}={A-Za-z}' -- "${candidates[@]}"
 }
 
-compdef _zrex zrex
+if [[ "${funcstack[1]-}" == "_zrex" ]]; then
+  _zrex "$@"
+else
+  compdef _zrex zrex
+fi
